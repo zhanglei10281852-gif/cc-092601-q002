@@ -5,6 +5,9 @@ import sqlite3
 from typing import Any, Iterable
 
 
+TERMINAL_STATUSES = frozenset({"cancelled", "succeeded", "failed"})
+
+
 class ComputeRepository:
     """封装计算任务运营领域的 SQLite 读写。"""
 
@@ -76,6 +79,28 @@ class ComputeRepository:
 
     def interventions(self, task_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute("SELECT * FROM compute_interventions WHERE task_id=? ORDER BY id", (task_id,)).fetchall()]
+
+    def cancel_record(self, task_id: int) -> dict[str, Any] | None:
+        """返回任务的取消协议视图：终态、发起人、原因、确认来源与各时间点。"""
+        row = self.connection.execute(
+            "SELECT id,status,cancel_requested_at,cancel_requested_by,cancel_reason,cancelled_at,cancelled_by,cancel_confirmed_by,cancel_confirm_source,finished_at FROM compute_tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "task_id": int(row["id"]),
+            "status": row["status"],
+            "terminal": row["status"] in TERMINAL_STATUSES,
+            "cancel_requested_at": row["cancel_requested_at"] or None,
+            "cancel_requested_by": row["cancel_requested_by"] or None,
+            "cancel_reason": row["cancel_reason"] or None,
+            "cancelled_at": row["cancelled_at"] or None,
+            "cancelled_by": row["cancelled_by"] or None,
+            "cancel_confirmed_by": row["cancel_confirmed_by"] or None,
+            "cancel_confirm_source": row["cancel_confirm_source"] or None,
+            "finished_at": row["finished_at"] or None,
+        }
 
     def add_intervention(self, *, task_id: int, actor: str, action: str, reason: str, before: dict[str, Any], after: dict[str, Any], batch_key: str, now: str) -> None:
         self.connection.execute(

@@ -261,6 +261,13 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     current_result_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
+    cancel_requested_at TEXT NOT NULL DEFAULT '',
+    cancel_requested_by TEXT NOT NULL DEFAULT '',
+    cancel_reason TEXT NOT NULL DEFAULT '',
+    cancelled_at TEXT NOT NULL DEFAULT '',
+    cancelled_by TEXT NOT NULL DEFAULT '',
+    cancel_confirmed_by TEXT NOT NULL DEFAULT '',
+    cancel_confirm_source TEXT NOT NULL DEFAULT '' CHECK(cancel_confirm_source IN ('','direct','worker','complete','failure','recovery')),
     version INTEGER NOT NULL DEFAULT 1,
     started_at TEXT,
     finished_at TEXT,
@@ -363,6 +370,7 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _migrate_compute_cancel_columns(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -385,6 +393,36 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+
+
+def _migrate_compute_cancel_columns(connection: sqlite3.Connection) -> None:
+    """为旧库补齐取消协议列，并收敛历史遗留的 cancel_requested 记录。"""
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(compute_tasks)").fetchall()}
+    additions = {
+        "cancel_requested_at": "TEXT NOT NULL DEFAULT ''",
+        "cancel_requested_by": "TEXT NOT NULL DEFAULT ''",
+        "cancel_reason": "TEXT NOT NULL DEFAULT ''",
+        "cancelled_at": "TEXT NOT NULL DEFAULT ''",
+        "cancelled_by": "TEXT NOT NULL DEFAULT ''",
+        "cancel_confirmed_by": "TEXT NOT NULL DEFAULT ''",
+        "cancel_confirm_source": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, declaration in additions.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE compute_tasks ADD COLUMN {name} {declaration}")
+    # 旧协议下可能永久滞留的 cancel_requested 记录：直接收敛为已取消并保留可查询信息。
+    stuck = connection.execute("SELECT id FROM compute_tasks WHERE status='cancel_requested'").fetchall()
+    if stuck:
+        now = to_storage(utc_now())
+        connection.execute(
+            "UPDATE compute_tasks SET status='cancelled',cancelled_at=?,cancelled_by=COALESCE(NULLIF(cancel_requested_by,''),'migration'),cancel_confirmed_by='schema-migration',cancel_confirm_source='recovery',lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE status='cancel_requested'",
+            (now, now, now),
+        )
+        for row in stuck:
+            connection.execute(
+                "INSERT INTO compute_interventions(task_id,actor,action,reason,before_json,after_json,batch_key,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (row[0], "schema-migration", "lease_recovery", "升级时收敛遗留的取消请求", "{}", "{}", "", now),
+            )
 
 
 def migrate_db() -> None:
