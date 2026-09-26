@@ -109,6 +109,9 @@ class ComputeOperationsService:
                 (expires, now, task_id, worker_id),
             )
             if cursor.rowcount != 1:
+                task = ComputeRepository(connection).task_by_id(task_id)
+                if task is not None and task["status"] == "cancel_requested" and task["lease_owner"] == worker_id:
+                    raise ConflictError("任务已请求取消，请确认取消并停止上报")
                 raise ConflictError("任务未由当前工作者持有")
             return dict(ComputeRepository(connection).task_by_id(task_id))
 
@@ -119,6 +122,8 @@ class ComputeOperationsService:
             task = repository.task_by_id(task_id)
             if task is None:
                 raise NotFoundError("计算任务不存在")
+            if task["status"] == "cancel_requested":
+                raise ConflictError("任务已进入取消流程，请确认取消并停止上报普通结果")
             if task["status"] != "running" or task["lease_owner"] != worker_id:
                 raise ConflictError("任务未由当前工作者持有")
             version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM compute_results WHERE task_id=?", (task_id,)).fetchone()[0])
@@ -126,10 +131,12 @@ class ComputeOperationsService:
                 "INSERT INTO compute_results(task_id,version,result_json,metrics_json,result_digest,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
                 (task_id, version, json.dumps(result, ensure_ascii=False, sort_keys=True), json.dumps(metrics, ensure_ascii=False, sort_keys=True), digest({"result": result, "metrics": metrics}), worker_id, now),
             )
-            connection.execute(
-                "UPDATE compute_tasks SET status='succeeded',current_result_version=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=?",
-                (version, now, now, task_id),
+            cursor = connection.execute(
+                "UPDATE compute_tasks SET status='succeeded',current_result_version=?,lease_owner='',lease_expires_at='',finished_at=?,updated_at=?,version=version+1 WHERE id=? AND status='running' AND lease_owner=?",
+                (version, now, now, task_id, worker_id),
             )
+            if cursor.rowcount != 1:
+                raise ConflictError("任务状态已变化，结果回执被拒绝")
             return dict(repository.task_by_id(task_id))
 
     def fail(self, task_id: int, worker_id: str, error_code: str, message: str, retryable: bool) -> dict[str, Any]:
@@ -140,6 +147,8 @@ class ComputeOperationsService:
             task = repository.task_by_id(task_id)
             if task is None:
                 raise NotFoundError("计算任务不存在")
+            if task["status"] == "cancel_requested":
+                raise ConflictError("任务已进入取消流程，请确认取消")
             if task["status"] != "running" or task["lease_owner"] != worker_id:
                 raise ConflictError("任务未由当前工作者持有")
             can_retry = retryable and int(task["attempt_count"]) < int(task["max_attempts"])
@@ -153,14 +162,63 @@ class ComputeOperationsService:
             return dict(repository.task_by_id(task_id))
 
     def cancel(self, task_id: int, actor: str, reason: str, batch_key: str = "") -> dict[str, Any]:
-        return self._intervene(task_id, actor, reason, "cancel", batch_key, self._cancel_mutation)
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            task = repository.task_by_id(task_id)
+            if task is None:
+                raise NotFoundError("计算任务不存在")
+            if task["status"] in {"cancel_requested", "cancelled"}:
+                # 重复取消返回同一业务结果，不产生新的状态变更或干预记录。
+                return dict(task)
+            if task["status"] not in {"queued", "running"}:
+                raise ConflictError("任务已终结，无法取消")
+            before = dict(task)
+            if task["status"] == "queued":
+                # 排队任务没有工作者需要确认，立即落为终态。
+                connection.execute(
+                    "UPDATE compute_tasks SET status='cancelled',cancel_requested_by=?,cancel_reason=?,cancel_requested_at=?,cancel_confirmed_by=?,cancel_confirmation_source='immediate',cancelled_at=?,finished_at=?,updated_at=?,version=version+1 WHERE id=? AND status='queued'",
+                    (actor, reason, now, actor, now, now, now, task_id),
+                )
+            else:
+                # 运行中任务进入取消请求，等待工作者确认或租约过期后由恢复流程落终态。
+                connection.execute(
+                    "UPDATE compute_tasks SET status='cancel_requested',cancel_requested_by=?,cancel_reason=?,cancel_requested_at=?,updated_at=?,version=version+1 WHERE id=? AND status='running'",
+                    (actor, reason, now, now, task_id),
+                )
+            after = dict(repository.task_by_id(task_id))
+            repository.add_intervention(task_id=task_id, actor=actor, action="cancel", reason=reason, before=before, after=after, batch_key=batch_key, now=now)
+            return after
+
+    def confirm_cancel(self, task_id: int, worker_id: str) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            task = repository.task_by_id(task_id)
+            if task is None:
+                raise NotFoundError("计算任务不存在")
+            if task["status"] == "cancelled":
+                # 已被确认或恢复流程落为终态，重复确认返回同一业务结果。
+                return dict(task)
+            if task["status"] != "cancel_requested":
+                raise ConflictError("当前任务状态不需要确认取消")
+            if task["lease_owner"] != worker_id:
+                raise ConflictError("任务未由当前工作者持有")
+            before = dict(task)
+            connection.execute(
+                "UPDATE compute_tasks SET status='cancelled',lease_owner='',lease_expires_at='',cancel_confirmed_by=?,cancel_confirmation_source='worker',cancelled_at=?,finished_at=?,updated_at=?,version=version+1 WHERE id=? AND status='cancel_requested'",
+                (worker_id, now, now, now, task_id),
+            )
+            after = dict(repository.task_by_id(task_id))
+            repository.add_intervention(task_id=task_id, actor=worker_id, action="cancel_confirm", reason="工作者确认取消", before=before, after=after, batch_key="", now=now)
+            return after
 
     def retry(self, task_id: int, actor: str, reason: str, priority: int | None = None, batch_key: str = "") -> dict[str, Any]:
         def mutate(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
             if task["status"] not in {"failed", "cancelled"}:
                 raise ConflictError("只有失败或已取消任务可以人工重试")
             chosen = task["priority"] if priority is None else priority
-            connection.execute("UPDATE compute_tasks SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',finished_at=NULL,updated_at=?,version=version+1 WHERE id=?", (chosen, now, now, task["id"]))
+            connection.execute("UPDATE compute_tasks SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',cancel_requested_by='',cancel_reason='',cancel_requested_at='',cancel_confirmed_by='',cancel_confirmation_source='',cancelled_at='',finished_at=NULL,updated_at=?,version=version+1 WHERE id=?", (chosen, now, now, task["id"]))
         return self._intervene(task_id, actor, reason, "retry", batch_key, mutate)
 
     def set_priority(self, task_id: int, actor: str, reason: str, priority: int, batch_key: str = "") -> dict[str, Any]:
@@ -191,6 +249,7 @@ class ComputeOperationsService:
         now = to_storage(self.clock.now())
         recovered: list[int] = []
         exhausted: list[int] = []
+        cancelled: list[int] = []
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
             rows = connection.execute("SELECT * FROM compute_tasks WHERE status='running' AND lease_expires_at<>'' AND lease_expires_at<? ORDER BY id", (now,)).fetchall()
@@ -208,7 +267,18 @@ class ComputeOperationsService:
                 )
                 after = dict(repository.task_by_id(task["id"]))
                 repository.add_intervention(task_id=task["id"], actor=actor, action="lease_recovery", reason="租约过期自动恢复", before=before, after=after, batch_key="", now=now)
-        return {"recovered": recovered, "exhausted": exhausted}
+            # 失联工作者的取消请求：租约过期后自动落为已取消终态。
+            stale = connection.execute("SELECT * FROM compute_tasks WHERE status='cancel_requested' AND lease_expires_at<? ORDER BY id", (now,)).fetchall()
+            for task in stale:
+                before = dict(task)
+                connection.execute(
+                    "UPDATE compute_tasks SET status='cancelled',lease_owner='',lease_expires_at='',cancel_confirmed_by=?,cancel_confirmation_source='recovery',cancelled_at=?,finished_at=?,updated_at=?,version=version+1 WHERE id=? AND status='cancel_requested'",
+                    (actor, now, now, now, task["id"]),
+                )
+                after = dict(repository.task_by_id(task["id"]))
+                repository.add_intervention(task_id=task["id"], actor=actor, action="cancel_recovery", reason="工作者失联，租约过期自动落为已取消", before=before, after=after, batch_key="", now=now)
+                cancelled.append(int(task["id"]))
+        return {"recovered": recovered, "exhausted": exhausted, "cancelled": cancelled}
 
     def summary(self) -> dict[str, Any]:
         rows = self.connection.execute("SELECT status,COUNT(*) AS amount FROM compute_tasks GROUP BY status ORDER BY status").fetchall()
@@ -228,13 +298,6 @@ class ComputeOperationsService:
             repository.add_intervention(task_id=task_id, actor=actor, action=action, reason=reason, before=before, after=after, batch_key=batch_key, now=now)
             return after
 
-    @staticmethod
-    def _cancel_mutation(connection: sqlite3.Connection, task: sqlite3.Row, now: str) -> None:
-        if task["status"] not in {"queued", "running"}:
-            raise ConflictError("当前任务状态不允许取消")
-        status = "cancel_requested" if task["status"] == "running" else "cancelled"
-        connection.execute("UPDATE compute_tasks SET status=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?", (status, None if status == "cancel_requested" else now, now, task["id"]))
-
     def _check_quota(self, repository: ComputeRepository, requested_by: str, now: datetime) -> None:
         quota = repository.quota("user", requested_by)
         if quota is None:
@@ -242,7 +305,9 @@ class ComputeOperationsService:
         states = repository.count_user_states(requested_by)
         if states.get("queued", 0) >= int(quota["max_queued"]):
             raise ConflictError("用户排队任务配额已用尽")
-        if states.get("running", 0) >= int(quota["max_running"]):
+        # 取消请求尚未收敛前仍占用运行配额，落为已取消终态后释放。
+        running = states.get("running", 0) + states.get("cancel_requested", 0)
+        if running >= int(quota["max_running"]):
             raise ConflictError("用户运行任务配额已用尽")
         day_start = to_storage(now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0))
         if repository.count_user_submissions_since(requested_by, day_start) >= int(quota["daily_submissions"]):

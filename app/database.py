@@ -261,6 +261,12 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
     current_result_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
+    cancel_requested_by TEXT NOT NULL DEFAULT '',
+    cancel_reason TEXT NOT NULL DEFAULT '',
+    cancel_requested_at TEXT NOT NULL DEFAULT '',
+    cancel_confirmed_by TEXT NOT NULL DEFAULT '',
+    cancel_confirmation_source TEXT NOT NULL DEFAULT '',
+    cancelled_at TEXT NOT NULL DEFAULT '',
     version INTEGER NOT NULL DEFAULT 1,
     started_at TEXT,
     finished_at TEXT,
@@ -294,6 +300,23 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
 '''
+
+# 取消协议元数据列：为既有数据库补充新增列（CREATE TABLE IF NOT EXISTS 不会修改已有表）。
+COMPUTE_TASK_CANCEL_COLUMNS = {
+    "cancel_requested_by": "TEXT NOT NULL DEFAULT ''",
+    "cancel_reason": "TEXT NOT NULL DEFAULT ''",
+    "cancel_requested_at": "TEXT NOT NULL DEFAULT ''",
+    "cancel_confirmed_by": "TEXT NOT NULL DEFAULT ''",
+    "cancel_confirmation_source": "TEXT NOT NULL DEFAULT ''",
+    "cancelled_at": "TEXT NOT NULL DEFAULT ''",
+}
+
+
+def _ensure_compute_task_columns(connection: sqlite3.Connection) -> None:
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(compute_tasks)").fetchall()}
+    for name, definition in COMPUTE_TASK_CANCEL_COLUMNS.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE compute_tasks ADD COLUMN {name} {definition}")
 
 PERMISSIONS = [
     ("users.read", "查看用户", "users", "read"),
@@ -363,6 +386,7 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _ensure_compute_task_columns(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",

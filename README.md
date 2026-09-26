@@ -51,6 +51,8 @@ curl -sS http://127.0.0.1:8432/api/system/health
 
 计算任务摘要位于 `/api/compute/summary`，模板、配额、提交、领取、回执和人工操作接口统一使用 `/api/compute` 前缀。
 
+运行中取消是可收敛的两阶段协议：`POST /tasks/{id}/cancel` 把运行中任务置为 `cancel_requested`（排队任务直接落为 `cancelled`），工作者通过 `POST /tasks/{id}/cancel-confirm` 确认后停止上报普通结果；工作者失联时租约过期由 `POST /recovery/expired-leases` 自动落为 `cancelled`。取消与成功回执竞争时只有一个终态，重复取消返回同一业务结果；任务详情可查询取消发起人、原因、确认来源（`worker`/`recovery`/`immediate`）与请求、确认时间。
+
 ## 测试
 
 ```bash
